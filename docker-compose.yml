@@ -1,11 +1,10 @@
 services:
   mysql:
     image: mysql:8.0
-    container_name: db_mysql
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: rootpass
-      MYSQL_DATABASE: appdb
+      MYSQL_DATABASE: mysql_db
       MYSQL_USER: appuser
       MYSQL_PASSWORD: apppass
     ports:
@@ -16,10 +15,9 @@ services:
 
   postgres:
     image: postgres:16
-    container_name: db_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: appdb
+      POSTGRES_DB: pg_db
       POSTGRES_USER: appuser
       POSTGRES_PASSWORD: apppass
     ports:
