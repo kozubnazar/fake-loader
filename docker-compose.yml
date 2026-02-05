@@ -6,7 +6,7 @@ services:
       MYSQL_ROOT_PASSWORD: rootpass
       MYSQL_DATABASE: mysql_db
       MYSQL_USER: appuser
-      MYSQL_PASSWORD: apppass
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     ports:
       - "3307:3306"
     volumes:
