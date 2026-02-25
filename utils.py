@@ -5,6 +5,7 @@ from typing import Any
 
 import pandas as pd
 from faker import Faker
+from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 
@@ -176,3 +177,243 @@ def build_receipt_and_item_batch(
             item_id_counter += 1
 
     return receipt_rows, receipt_item_rows, receipt_id_counter, item_id_counter
+
+def create_postgres_schema(pg_conn: Connection) -> None:
+    ddl_statements = [
+        """
+        CREATE TABLE IF NOT EXISTS category (
+            id VARCHAR(100) PRIMARY KEY,
+            name VARCHAR(200) NOT NULL,
+            parent_id VARCHAR(100) NULL,
+            CONSTRAINT fk_category_parent FOREIGN KEY (parent_id) REFERENCES category(id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS brand (
+            id VARCHAR(100) PRIMARY KEY,
+            name VARCHAR(200) NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS storegroup (
+            id VARCHAR(100) PRIMARY KEY,
+            name VARCHAR(200) NOT NULL,
+            parent_id VARCHAR(100) NULL,
+            CONSTRAINT fk_storegroup_parent FOREIGN KEY (parent_id) REFERENCES storegroup(id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS store (
+            id VARCHAR(100) PRIMARY KEY,
+            name VARCHAR(200) NOT NULL,
+            group_id VARCHAR(100) NULL,
+            trade_area NUMERIC(20,4) NULL,
+            place VARCHAR(200) NULL,
+            address VARCHAR(200) NULL,
+            CONSTRAINT fk_store_group FOREIGN KEY (group_id) REFERENCES storegroup(id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS terminal (
+            id VARCHAR(100) PRIMARY KEY,
+            name VARCHAR(200) NOT NULL,
+            store_id VARCHAR(100) NOT NULL,
+            CONSTRAINT fk_terminal_store FOREIGN KEY (store_id) REFERENCES store(id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS product (
+            id VARCHAR(100) PRIMARY KEY,
+            name VARCHAR(200) NOT NULL,
+            code VARCHAR(100) NOT NULL,
+            barcode TEXT NULL,
+            category_id VARCHAR(100) NOT NULL,
+            CONSTRAINT fk_product_category FOREIGN KEY (category_id) REFERENCES category(id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS receipt (
+            id VARCHAR(100) PRIMARY KEY,
+            store_id VARCHAR(100) NOT NULL,
+            terminal_id VARCHAR(100) NOT NULL,
+            opened_at TIMESTAMP NOT NULL,
+            closed_at TIMESTAMP NOT NULL,
+            CONSTRAINT fk_receipt_store FOREIGN KEY (store_id) REFERENCES store(id),
+            CONSTRAINT fk_receipt_terminal FOREIGN KEY (terminal_id) REFERENCES terminal(id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS receiptitem (
+            id VARCHAR(100) PRIMARY KEY,
+            receipt_id VARCHAR(100) NOT NULL,
+            product_id VARCHAR(100) NOT NULL,
+            receipt_closed_at TIMESTAMP NOT NULL,
+            price NUMERIC(20,4) NOT NULL,
+            qty NUMERIC(20,4) NOT NULL,
+            turnover NUMERIC(20,4) NOT NULL,
+            cost_price NUMERIC(20,4) NOT NULL,
+            CONSTRAINT fk_receiptitem_receipt FOREIGN KEY (receipt_id) REFERENCES receipt(id),
+            CONSTRAINT fk_receiptitem_product FOREIGN KEY (product_id) REFERENCES product(id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_category_parent ON category(parent_id)",
+        "CREATE INDEX IF NOT EXISTS idx_storegroup_parent ON storegroup(parent_id)",
+        "CREATE INDEX IF NOT EXISTS idx_store_group ON store(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_terminal_store ON terminal(store_id)",
+        "CREATE INDEX IF NOT EXISTS idx_product_category ON product(category_id)",
+        "CREATE INDEX IF NOT EXISTS idx_receipt_store ON receipt(store_id)",
+        "CREATE INDEX IF NOT EXISTS idx_receipt_terminal ON receipt(terminal_id)",
+        "CREATE INDEX IF NOT EXISTS idx_receipt_opened ON receipt(opened_at)",
+        "CREATE INDEX IF NOT EXISTS idx_receiptitem_receipt ON receiptitem(receipt_id)",
+        "CREATE INDEX IF NOT EXISTS idx_receiptitem_product ON receiptitem(product_id)",
+        "CREATE INDEX IF NOT EXISTS idx_receiptitem_closed ON receiptitem(receipt_closed_at)",
+    ]
+
+    for stmt in ddl_statements:
+        pg_conn.execute(text(stmt))
+
+def _to_records_with_nulls(df: pd.DataFrame) -> list[dict[str, Any]]:
+    normalized = df.astype(object).where(pd.notna(df), None)
+    return normalized.to_dict(orient="records")
+
+
+def copy_reference_table(
+    mysql_conn: Connection,
+    pg_conn: Connection,
+    table_name: str,
+    columns: list[str],
+    chunk_size: int = 5000,
+) -> int:
+    # Для self-parent таблиць батьки (NULL) йдуть першими, далі по id
+    if table_name in {"category", "storegroup"} and "parent_id" in columns:
+        order_sql = "CASE WHEN parent_id IS NULL THEN 0 ELSE 1 END, CAST(id AS UNSIGNED)"
+    else:
+        order_sql = "CAST(id AS UNSIGNED)"
+
+    query = f"SELECT {', '.join(columns)} FROM {table_name} ORDER BY {order_sql}"
+    total = 0
+
+    cols_sql = ", ".join(columns)
+    vals_sql = ", ".join(f":{c}" for c in columns)
+    upsert_sql = text(
+        f"""
+        INSERT INTO {table_name} ({cols_sql})
+        VALUES ({vals_sql})
+        ON CONFLICT (id) DO NOTHING
+        """
+    )
+
+    for chunk in pd.read_sql_query(text(query), mysql_conn, chunksize=chunk_size):
+        if chunk.empty:
+            continue
+
+        rows = _to_records_with_nulls(chunk)
+        pg_conn.execute(upsert_sql, rows)
+        total += len(rows)
+
+    return total
+
+
+def get_receipt_days(mysql_conn: Connection) -> list:
+    rows = mysql_conn.execute(
+        text(
+            """
+            SELECT DATE(opened_at) AS day_value
+            FROM receipt
+            GROUP BY DATE(opened_at)
+            ORDER BY DATE(opened_at)
+            """
+        )
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def delete_documents_for_day(pg_conn: Connection, day_start: datetime, day_end: datetime) -> None:
+    pg_conn.execute(
+        text(
+            """
+            DELETE FROM receiptitem ri
+            USING receipt r
+            WHERE ri.receipt_id = r.id
+              AND r.opened_at >= :day_start
+              AND r.opened_at < :day_end
+            """
+        ),
+        {"day_start": day_start, "day_end": day_end},
+    )
+
+    pg_conn.execute(
+        text(
+            """
+            DELETE FROM receipt
+            WHERE opened_at >= :day_start
+              AND opened_at < :day_end
+            """
+        ),
+        {"day_start": day_start, "day_end": day_end},
+    )
+
+
+def copy_receipts_for_day(
+    mysql_conn: Connection,
+    pg_conn: Connection,
+    day_start: datetime,
+    day_end: datetime,
+    chunk_size: int = 5000,
+) -> int:
+    query = text(
+        """
+        SELECT id, store_id, terminal_id, opened_at, closed_at
+        FROM receipt
+        WHERE opened_at >= :day_start
+          AND opened_at < :day_end
+        ORDER BY opened_at, id
+        """
+    )
+
+    total = 0
+    for chunk in pd.read_sql_query(
+        query,
+        mysql_conn,
+        params={"day_start": day_start, "day_end": day_end},
+        chunksize=chunk_size,
+    ):
+        if chunk.empty:
+            continue
+        chunk.to_sql("receipt", pg_conn, if_exists="append", index=False, method="multi", chunksize=chunk_size)
+        total += len(chunk)
+
+    return total
+
+
+def copy_receiptitems_for_day(
+    mysql_conn: Connection,
+    pg_conn: Connection,
+    day_start: datetime,
+    day_end: datetime,
+    chunk_size: int = 10000,
+) -> int:
+    query = text(
+        """
+        SELECT ri.id, ri.receipt_id, ri.product_id, ri.receipt_closed_at, ri.price, ri.qty, ri.turnover, ri.cost_price
+        FROM receiptitem ri
+        JOIN receipt r ON r.id = ri.receipt_id
+        WHERE r.opened_at >= :day_start
+          AND r.opened_at < :day_end
+        ORDER BY ri.receipt_closed_at, ri.id
+        """
+    )
+
+    total = 0
+    for chunk in pd.read_sql_query(
+        query,
+        mysql_conn,
+        params={"day_start": day_start, "day_end": day_end},
+        chunksize=chunk_size,
+    ):
+        if chunk.empty:
+            continue
+        chunk.to_sql("receiptitem", pg_conn, if_exists="append", index=False, method="multi", chunksize=chunk_size)
+        total += len(chunk)
+
+    return total
