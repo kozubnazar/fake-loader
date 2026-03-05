@@ -14,7 +14,7 @@ REFERENCE_TABLES = {
     "category": ["id", "name", "parent_id"],
     "brand": ["id", "name"],
     "storegroup": ["id", "name", "parent_id"],
-    "store": ["id", "name", "group_id", "trade_area", "place", "address"],
+    "store": ["id", "name", "group_id"],
     "terminal": ["id", "name", "store_id"],
     "product": ["id", "name", "code", "barcode", "category_id"],
 }
@@ -29,12 +29,11 @@ def main() -> None:
     pg_conn = get_postgres_connection()
 
     try:
-        # 1) Створити порожню схему в PostgreSQL
         create_postgres_schema(pg_conn)
         pg_conn.commit()
         print("PostgreSQL schema is ready.")
 
-        # 2) Довідники: тільки довантаження (upsert do nothing)
+        # upsert do nothing
         for table_name, columns in REFERENCE_TABLES.items():
             inserted = copy_reference_table(
                 mysql_conn=mysql_conn,
@@ -46,7 +45,7 @@ def main() -> None:
             pg_conn.commit()
             print(f"[REF] {table_name}: processed {inserted} rows")
 
-        # 3) Документи: перевантаження по днях
+        # перевантаження по днях
         days = get_receipt_days(mysql_conn)
         print(f"Document days to reload: {len(days)}")
 
